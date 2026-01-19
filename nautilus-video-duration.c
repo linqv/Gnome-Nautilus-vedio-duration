@@ -404,20 +404,23 @@ static void helper_instance_destroy(HelperInstance *h) {
       g_output_stream_flush(h->out, NULL, NULL);
     }
 
-    /* 再保险：SIGTERM -> 等待 -> SIGKILL */
+    /* 请求退出（SIGTERM） */
     g_subprocess_send_signal(h->proc, SIGTERM);
 
-    /* 等最多 200ms */
+    /* 等最多 200ms：轮询 status（结束后才会变为 != -1） */
     for (int i = 0; i < 20; i++) {
       int st = g_subprocess_get_status(h->proc);
-      if (st != -1 && (WIFEXITED(st) || WIFSIGNALED(st)))        break;
+      if (st != -1 && (WIFEXITED(st) || WIFSIGNALED(st)))
+        break;
       g_usleep(10 * 1000);
     }
 
+    /* 仍未退出：强制结束（比 SIGKILL 更靠谱，glib 自己处理） */
     {
       int st2 = g_subprocess_get_status(h->proc);
       if (!(st2 != -1 && (WIFEXITED(st2) || WIFSIGNALED(st2)))) {
-      g_subprocess_send_signal(h->proc, SIGKILL);
+        g_subprocess_force_exit(h->proc);
+      }
     }
 
     /* wait 一下，避免僵尸 */
