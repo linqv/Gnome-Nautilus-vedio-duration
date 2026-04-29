@@ -132,36 +132,40 @@ static GSettings *nautilus_list_view_settings = NULL;
 static volatile gint duration_column_enabled = 1;
 
 /* ------------------- Helpers ------------------- */
-static gboolean is_media_file(const gchar *name) {
-  if (!name)
-    return FALSE;
-  const gchar *ext = strrchr(name, '.');
-  if (!ext)
-    return FALSE;
-  ext++;
-  const gchar *media_exts[] = {
-      "mp4", "mkv",  "avi",  "mov", "webm", "flv",  "wmv",  "m4v", "mpeg",
-      "mpg", "m2ts", "ts",   "3gp", "ogv",  "mp3",  "flac", "wav", "aac",
-      "m4a", "ogg",  "opus", "wma", "alac", "aiff", NULL};
-  for (int i = 0; media_exts[i]; i++)
-    if (g_ascii_strcasecmp(ext, media_exts[i]) == 0)
+typedef enum {
+  MEDIA_KIND_NONE = 0,
+  MEDIA_KIND_VIDEO,
+  MEDIA_KIND_AUDIO,
+} MediaKind;
+
+static gboolean extension_matches(const gchar *ext,
+                                  const gchar *const *exts) {
+  for (int i = 0; exts[i]; i++)
+    if (g_ascii_strcasecmp(ext, exts[i]) == 0)
       return TRUE;
   return FALSE;
 }
 
-static gboolean is_audio_ext(const gchar *name) {
+static MediaKind media_kind_from_name(const gchar *name) {
   if (!name)
-    return FALSE;
+    return MEDIA_KIND_NONE;
   const gchar *ext = strrchr(name, '.');
   if (!ext)
-    return FALSE;
+    return MEDIA_KIND_NONE;
   ext++;
-  const gchar *audio_exts[] = {"mp3",  "flac", "wav",  "aac",  "m4a", "ogg",
-                               "opus", "wma",  "alac", "aiff","mka",NULL};
-  for (int i = 0; audio_exts[i]; i++)
-    if (g_ascii_strcasecmp(ext, audio_exts[i]) == 0)
-      return TRUE;
-  return FALSE;
+
+  static const gchar *const audio_exts[] = {
+      "mp3", "flac", "wav", "aac", "m4a", "ogg",
+      "opus", "wma", "alac", "aiff", NULL};
+  static const gchar *const video_exts[] = {
+      "mp4", "mkv",  "avi", "mov",  "webm", "flv", "wmv", "m4v",
+      "mpeg", "mpg",  "m2ts", "ts",   "3gp",  "ogv", NULL};
+
+  if (extension_matches(ext, audio_exts))
+    return MEDIA_KIND_AUDIO;
+  if (extension_matches(ext, video_exts))
+    return MEDIA_KIND_VIDEO;
+  return MEDIA_KIND_NONE;
 }
 
 static const gchar *format_seconds_buf(guint32 sec, gboolean is_audio,
@@ -1252,8 +1256,12 @@ static void schedule_duration_job(NautilusFileInfo *file) {
   if (!g_atomic_int_get(&duration_column_enabled))
     return;
 
+  if (nautilus_file_info_get_file_type(file) == G_FILE_TYPE_DIRECTORY)
+    return;
+
   gchar *name = nautilus_file_info_get_name(file);
-  if (!is_media_file(name)) {
+  MediaKind media_kind = media_kind_from_name(name);
+  if (media_kind == MEDIA_KIND_NONE) {
     g_free(name);
     return;
   }
@@ -1273,7 +1281,7 @@ static void schedule_duration_job(NautilusFileInfo *file) {
 
   guint64 key = make_key_u64(path, mtime, size);
   gint64 now_us = g_get_monotonic_time();
-  gboolean audio = is_audio_ext(path);
+  gboolean audio = (media_kind == MEDIA_KIND_AUDIO);
 
   g_rw_lock_writer_lock(&cache_rwlock);
 
