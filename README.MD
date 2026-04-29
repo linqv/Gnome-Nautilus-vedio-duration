@@ -64,7 +64,7 @@ Nautilus 扩展本体不直接链接 FFmpeg，并提供：
 - `libnautilus-extension-4`
 - `glib-2.0`, `gio-2.0`, `gmodule-2.0`
 - `libavformat`, `libavutil`
-- `cmake >= 3.10`, `ninja` 或 `make`
+- `cmake >= 3.10`, `make` 或 `ninja`
 
 ### 按上游发行版的安装说明
 
@@ -122,9 +122,7 @@ sudo pacman -S --needed \
 ## 构建与安装
 
 ```bash
-cmake -S . -B build -G Ninja
-cmake --build build -j$(nproc)
-sudo cmake --install build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && sudo cmake --install build
 nautilus -q
 ```
 

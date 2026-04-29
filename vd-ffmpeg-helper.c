@@ -2,6 +2,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>  /* for strcasecmp */
+#include <unistd.h>   /* for getppid */
+#include <limits.h>   /* for PATH_MAX */
 
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
@@ -58,6 +61,24 @@ static void set_probe_opts(AVDictionary **d, int pass) {
     av_dict_set(d, "analyzeduration", "1000000", 0); /* 1s */
   }
   av_dict_set(d, "max_delay", "0", 0);
+}
+
+/* Container strategy detection for optimization */
+#define STRATEGY_TWO_PASS 0
+#define STRATEGY_HEADER_ONLY 1
+
+static int detect_container_strategy(const char *path) {
+  if (!path)
+    return STRATEGY_TWO_PASS;
+  const char *ext = strrchr(path, '.');
+  if (!ext)
+    return STRATEGY_TWO_PASS;
+  /* MP4/MOV/M4V files typically have moov atom at start, header read sufficient */
+  if (strcasecmp(ext, ".mp4") == 0 || strcasecmp(ext, ".mov") == 0 ||
+      strcasecmp(ext, ".m4v") == 0 || strcasecmp(ext, ".m4a") == 0) {
+    return STRATEGY_HEADER_ONLY;
+  }
+  return STRATEGY_TWO_PASS;
 }
 
 static int run_one_pass(const char *path, int timeout_ms, int pass,
@@ -132,15 +153,32 @@ static void get_duration_adaptive(const char *path, int t1_ms, int t2_ms,
   if (out_timeout_flag)
     *out_timeout_flag = 0;
 
+  int strategy = detect_container_strategy(path);
   uint32_t sec = 0;
   int to1 = 0;
 
+  /* Pass 0: fast probe */
   (void)run_one_pass(path, t1_ms, 0, &sec, &to1);
   if (sec > 0) {
     *out_sec = sec;
     return;
   }
 
+  /* For HEADER_ONLY strategy (MP4/MOV), if pass0 failed, try pass1 with shorter timeout */
+  if (strategy == STRATEGY_HEADER_ONLY) {
+    /* MP4/MOV should succeed with header only; if not, file may be corrupt */
+    int to2 = 0;
+    (void)run_one_pass(path, t1_ms, 1, &sec, &to2);
+    if (sec > 0) {
+      *out_sec = sec;
+      return;
+    }
+    if (out_timeout_flag)
+      *out_timeout_flag = (to1 || to2) ? 1 : 0;
+    return;
+  }
+
+  /* TWO_PASS strategy: full probe */
   int to2 = 0;
   (void)run_one_pass(path, t2_ms, 1, &sec, &to2);
   if (sec > 0) {
@@ -190,7 +228,15 @@ int main(void) {
   av_log_set_level(AV_LOG_QUIET);
   avformat_network_init();
 
+  /* 孤儿进程检测：记录原始父进程 ID */
+  pid_t original_ppid = getppid();
+
   while (1) {
+    /* 检测父进程是否已退出（被 init 收养） */
+    if (getppid() != original_ppid) {
+      break;  /* 父进程已退出，自动终止 */
+    }
+
     char *line = read_line(stdin);
     if (!line)
       break;
@@ -247,7 +293,7 @@ int main(void) {
 
     int path_len = 0;
     uint8_t *path_buf = b64_decode_av(b64, &path_len);
-    if (!path_buf || path_len <= 0) {
+    if (!path_buf || path_len <= 0 || path_len >= PATH_MAX) {
       printf("OK 0 \n");
       fflush(stdout);
       free(path_buf);
