@@ -47,6 +47,8 @@
 #define FLAG_NEGATIVE (1u << 2)
 #define FLAG_QUEUED (1u << 3)
 
+#define DURATION_TEXT_MAX 32
+
 #define VIDEO_DURATION_TYPE (video_duration_get_type())
 G_DECLARE_FINAL_TYPE(VideoDuration, video_duration, VIDEO, DURATION, GObject)
 
@@ -83,17 +85,22 @@ struct _CacheEntry {
 };
 
 /* ------------------- Job ------------------- */
-typedef struct {
+typedef struct _Job Job;
+
+struct _Job {
   NautilusFileInfo *file;
   gchar *path;
   guint64 key;
   gboolean audio; /* worker 不再 basename 分配 */
-} Job;
+  Job *pending_next;
+};
 
 /* ------------------- Globals ------------------- */
 static GThread **workers = NULL;
 static gint worker_count = 0;
-static GQueue *pending = NULL;
+static Job *pending_head = NULL;
+static Job *pending_tail = NULL;
+static guint pending_length = 0;
 static GCond pending_cond;
 static guint queue_max = DEFAULT_QUEUE_MAX;
 
@@ -157,17 +164,20 @@ static gboolean is_audio_ext(const gchar *name) {
   return FALSE;
 }
 
-static gchar *format_seconds(guint32 sec, gboolean is_audio) {
+static const gchar *format_seconds_buf(guint32 sec, gboolean is_audio,
+                                       gchar buf[DURATION_TEXT_MAX]) {
   if (sec == 0)
-    return g_strdup("-");
+    return "-";
   if (is_audio && sec < 3600) {
     guint32 m = sec / 60, s = sec % 60;
-    return g_strdup_printf("%02u:%02u", m, s);
+    g_snprintf(buf, DURATION_TEXT_MAX, "%02u:%02u", m, s);
+    return buf;
   }
   guint32 h = sec / 3600;
   guint32 m = (sec % 3600) / 60;
   guint32 s = sec % 60;
-  return g_strdup_printf("%u:%02u:%02u", h, m, s);
+  g_snprintf(buf, DURATION_TEXT_MAX, "%u:%02u:%02u", h, m, s);
+  return buf;
 }
 
 static gboolean visible_columns_contain_duration(GSettings *settings) {
@@ -342,6 +352,41 @@ static void evict_if_needed_unlocked(void) {
   }
 }
 
+/* ------------------- Pending Queue ------------------- */
+static gboolean pending_queue_is_empty_unlocked(void) {
+  return pending_head == NULL;
+}
+
+static void pending_queue_push_tail_unlocked(Job *job) {
+  if (!job)
+    return;
+
+  job->pending_next = NULL;
+  if (pending_tail)
+    pending_tail->pending_next = job;
+  else
+    pending_head = job;
+
+  pending_tail = job;
+  pending_length++;
+}
+
+static Job *pending_queue_pop_head_unlocked(void) {
+  Job *job = pending_head;
+  if (!job)
+    return NULL;
+
+  pending_head = job->pending_next;
+  if (!pending_head)
+    pending_tail = NULL;
+
+  job->pending_next = NULL;
+  if (pending_length > 0)
+    pending_length--;
+
+  return job;
+}
+
 /* ------------------- File stat ------------------- */
 static gboolean get_local_path_and_stat(const gchar *uri, gchar **out_path,
                                         guint64 *out_mtime, guint64 *out_size) {
@@ -430,14 +475,12 @@ static gboolean apply_update_main(gpointer data) {
     return G_SOURCE_REMOVE;
 
   if (!g_atomic_int_get(&shutting_down)) {
-    gchar *dur = NULL;
-    if (!u->negative && u->seconds > 0)
-      dur = format_seconds(u->seconds, u->audio);
-    else
-      dur = g_strdup("-");
-
-    nautilus_file_info_add_string_attribute(u->file, ATTR_KEY, dur);
-    g_free(dur);
+    gchar dur[DURATION_TEXT_MAX];
+    const gchar *text =
+        (!u->negative && u->seconds > 0)
+            ? format_seconds_buf(u->seconds, u->audio, dur)
+            : "-";
+    nautilus_file_info_add_string_attribute(u->file, ATTR_KEY, text);
   }
 
   g_object_unref(u->file);
@@ -1183,7 +1226,8 @@ static gpointer worker_thread(gpointer data) {
   (void)data;
   for (;;) {
     g_mutex_lock(&pending_lock);
-    while (!g_atomic_int_get(&shutting_down) && g_queue_is_empty(pending))
+    while (!g_atomic_int_get(&shutting_down) &&
+           pending_queue_is_empty_unlocked())
       g_cond_wait(&pending_cond, &pending_lock);
 
     if (g_atomic_int_get(&shutting_down)) {
@@ -1191,7 +1235,7 @@ static gpointer worker_thread(gpointer data) {
       break;
     }
 
-    Job *job = g_queue_pop_head(pending);
+    Job *job = pending_queue_pop_head_unlocked();
     g_mutex_unlock(&pending_lock);
 
     if (job)
@@ -1267,9 +1311,9 @@ static void schedule_duration_job(NautilusFileInfo *file) {
     gint64 dt = now_us - e->last_request_us;
     if (dt < (gint64)debounce_ms * 1000) {
       if (e->flags & FLAG_HAS_VALUE) {
-        gchar *dur = format_seconds(e->seconds, audio);
-        nautilus_file_info_add_string_attribute(file, ATTR_KEY, dur);
-        g_free(dur);
+        gchar dur[DURATION_TEXT_MAX];
+        const gchar *text = format_seconds_buf(e->seconds, audio, dur);
+        nautilus_file_info_add_string_attribute(file, ATTR_KEY, text);
         lru_touch_unlocked(e);
         g_rw_lock_writer_unlock(&cache_rwlock);
         g_free(path);
@@ -1293,9 +1337,9 @@ static void schedule_duration_job(NautilusFileInfo *file) {
 
   /* cache hit */
   if (e->flags & FLAG_HAS_VALUE) {
-    gchar *dur = format_seconds(e->seconds, audio);
-    nautilus_file_info_add_string_attribute(file, ATTR_KEY, dur);
-    g_free(dur);
+    gchar dur[DURATION_TEXT_MAX];
+    const gchar *text = format_seconds_buf(e->seconds, audio, dur);
+    nautilus_file_info_add_string_attribute(file, ATTR_KEY, text);
     lru_touch_unlocked(e);
     g_rw_lock_writer_unlock(&cache_rwlock);
     g_free(path);
@@ -1333,28 +1377,29 @@ static void schedule_duration_job(NautilusFileInfo *file) {
     path = NULL;
 
     Job *dropped = NULL;
-    if (pending && g_queue_get_length(pending) >= queue_max) {
-      dropped = g_queue_pop_head(pending);
-      if (dropped) {
-        gpointer dfk = NULL, dfv = NULL;
-        if (g_hash_table_lookup_extended(entries, &dropped->key, &dfk, &dfv)) {
-          CacheEntry *de = dfv;
-          de->flags &= ~(FLAG_INFLIGHT | FLAG_QUEUED);
+    g_mutex_lock(&pending_lock);
+    if (pending_length >= queue_max)
+      dropped = pending_queue_pop_head_unlocked();
+    pending_queue_push_tail_unlocked(job);
+    g_cond_signal(&pending_cond);
+    g_mutex_unlock(&pending_lock);
 
-          if (drop_negative_ttl_ms > 0) {
-            de->flags &= ~FLAG_HAS_VALUE;
-            de->flags |= FLAG_NEGATIVE;
-            de->seconds = 0;
-            de->negative_until_us =
-                now_us + (gint64)drop_negative_ttl_ms * 1000;
-            lru_touch_unlocked(de);
-          }
+    if (dropped) {
+      gpointer dfk = NULL, dfv = NULL;
+      if (g_hash_table_lookup_extended(entries, &dropped->key, &dfk, &dfv)) {
+        CacheEntry *de = dfv;
+        de->flags &= ~(FLAG_INFLIGHT | FLAG_QUEUED);
+
+        if (drop_negative_ttl_ms > 0) {
+          de->flags &= ~FLAG_HAS_VALUE;
+          de->flags |= FLAG_NEGATIVE;
+          de->seconds = 0;
+          de->negative_until_us =
+              now_us + (gint64)drop_negative_ttl_ms * 1000;
+          lru_touch_unlocked(de);
         }
       }
     }
-
-    g_queue_push_tail(pending, job);
-    g_cond_signal(&pending_cond);
 
     if (dropped)
       job_free(dropped);
@@ -1428,7 +1473,9 @@ void nautilus_module_initialize(GTypeModule *module) {
 
   entries =
       g_hash_table_new_full(key_u64_hash, key_u64_equal, NULL, entry_destroy);
-  pending = g_queue_new();
+  pending_head = NULL;
+  pending_tail = NULL;
+  pending_length = 0;
 
   helper_pool_init(&helper_pool, (gint)helper_max);
 
@@ -1494,15 +1541,14 @@ void nautilus_module_shutdown(void) {
 
   g_rw_lock_writer_lock(&cache_rwlock);
 
-  if (pending) {
-    while (!g_queue_is_empty(pending)) {
-      Job *job = g_queue_pop_head(pending);
-      if (job)
-        job_free(job);
-    }
-    g_queue_free(pending);
-    pending = NULL;
+  g_mutex_lock(&pending_lock);
+  for (;;) {
+    Job *job = pending_queue_pop_head_unlocked();
+    if (!job)
+      break;
+    job_free(job);
   }
+  g_mutex_unlock(&pending_lock);
 
   lru_reset_unlocked();
 
