@@ -3,10 +3,11 @@
 #include <glib.h>
 #include <nautilus-extension.h>
 /* for WIFEXITED/WIFSIGNALED */
-#include <sys/wait.h>
 #include <signal.h>
-#include <string.h>  /* for memcpy */
-#include <setjmp.h>  /* for sigjmp_buf for crash protection */
+#include <setjmp.h>   /* for sigjmp_buf for crash protection */
+#include <string.h>   /* for memcpy */
+#include <sys/stat.h> /* for stat */
+#include <sys/wait.h>
 
 /* Embedded FFmpeg support (direct API calls, no IPC overhead) */
 #include <libavformat/avformat.h>
@@ -64,8 +65,10 @@ G_DEFINE_DYNAMIC_TYPE_EXTENDED(
                                       info_provider_iface_init))
 
 /* ------------------- Cache Entry ------------------- */
-typedef struct {
-  guint64 *keyp;
+typedef struct _CacheEntry CacheEntry;
+
+struct _CacheEntry {
+  guint64 key;
   guint64 mtime;
   guint64 size;
 
@@ -75,8 +78,9 @@ typedef struct {
   gint64 negative_until_us;
   gint64 last_request_us;
 
-  GList *lru_link; /* O(1) */
-} CacheEntry;
+  CacheEntry *lru_prev;
+  CacheEntry *lru_next;
+};
 
 /* ------------------- Job ------------------- */
 typedef struct {
@@ -97,8 +101,10 @@ static guint queue_max = DEFAULT_QUEUE_MAX;
 static GMutex pending_lock;        /* protects pending queue only */
 static GRWLock cache_rwlock;       /* protects entries/lru - allows concurrent reads */
 
-static GHashTable *entries = NULL; /* key(uint64*) -> CacheEntry* */
-static GQueue *lru = NULL;
+static GHashTable *entries = NULL; /* key(&CacheEntry.key) -> CacheEntry* */
+static CacheEntry *lru_head = NULL;
+static CacheEntry *lru_tail = NULL;
+static guint lru_length = 0;
 
 static volatile gint shutting_down = 0;
 static guint cache_max_entries = DEFAULT_CACHE_MAX_ENTRIES;
@@ -222,34 +228,87 @@ static gboolean key_u64_equal(gconstpointer a, gconstpointer b) {
 }
 
 /* ------------------- LRU ------------------- */
+static gboolean lru_is_linked_unlocked(const CacheEntry *e) {
+  return e && (e == lru_head || e->lru_prev || e->lru_next);
+}
+
+static void lru_unlink_unlocked(CacheEntry *e) {
+  if (!lru_is_linked_unlocked(e))
+    return;
+
+  if (e->lru_prev)
+    e->lru_prev->lru_next = e->lru_next;
+  else
+    lru_head = e->lru_next;
+
+  if (e->lru_next)
+    e->lru_next->lru_prev = e->lru_prev;
+  else
+    lru_tail = e->lru_prev;
+
+  e->lru_prev = NULL;
+  e->lru_next = NULL;
+
+  if (lru_length > 0)
+    lru_length--;
+}
+
+static void lru_append_tail_unlocked(CacheEntry *e) {
+  if (!e)
+    return;
+
+  e->lru_prev = lru_tail;
+  e->lru_next = NULL;
+
+  if (lru_tail)
+    lru_tail->lru_next = e;
+  else
+    lru_head = e;
+
+  lru_tail = e;
+  lru_length++;
+}
+
 static void lru_touch_unlocked(CacheEntry *e) {
   if (!e)
     return;
-  if (e->lru_link) {
-    g_queue_unlink(lru, e->lru_link);
-    g_queue_push_tail_link(lru, e->lru_link);
-  } else {
-    g_queue_push_tail(lru, e);
-    e->lru_link = g_queue_peek_tail_link(lru);
-  }
+
+  if (e == lru_tail && lru_is_linked_unlocked(e))
+    return;
+
+  lru_unlink_unlocked(e);
+  lru_append_tail_unlocked(e);
+}
+
+static CacheEntry *lru_pop_head_unlocked(void) {
+  CacheEntry *e = lru_head;
+  if (!e)
+    return NULL;
+
+  lru_unlink_unlocked(e);
+  return e;
+}
+
+static void lru_reset_unlocked(void) {
+  lru_head = NULL;
+  lru_tail = NULL;
+  lru_length = 0;
 }
 
 static void entry_destroy(gpointer data) {
   CacheEntry *e = data;
   if (!e)
     return;
-  e->lru_link = NULL;
+  e->lru_prev = NULL;
+  e->lru_next = NULL;
   g_free(e);
 }
 
 static void cache_entry_remove_unlocked(CacheEntry *e) {
   if (!e)
     return;
-  if (e->lru_link) {
-    g_queue_unlink(lru, e->lru_link);
-    e->lru_link = NULL;
-  }
-  g_hash_table_remove(entries, e->keyp);
+  lru_unlink_unlocked(e);
+  g_hash_table_remove(entries, &e->key);
 }
 
 static void evict_if_needed_unlocked(void) {
@@ -262,25 +321,22 @@ static void evict_if_needed_unlocked(void) {
     target = 1;
 
   guint tries = 0;
-  guint max_tries = (guint)g_queue_get_length(lru);
+  guint max_tries = lru_length;
   if (max_tries < 1)
     max_tries = 1;
 
   while (sz > target && tries < max_tries) {
-    CacheEntry *old = g_queue_pop_head(lru);
+    CacheEntry *old = lru_pop_head_unlocked();
     if (!old)
       break;
 
-    old->lru_link = NULL;
-
     if (old->flags & FLAG_INFLIGHT) {
-      g_queue_push_tail(lru, old);
-      old->lru_link = g_queue_peek_tail_link(lru);
+      lru_append_tail_unlocked(old);
       tries++;
       continue;
     }
 
-    g_hash_table_remove(entries, old->keyp);
+    g_hash_table_remove(entries, &old->key);
     sz--;
     tries++;
   }
@@ -299,19 +355,14 @@ static gboolean get_local_path_and_stat(const gchar *uri, gchar **out_path,
   if (!path)
     return FALSE;
 
-  GFile *gf = g_file_new_for_path(path);
-  GFileInfo *fi = g_file_query_info(
-      gf, G_FILE_ATTRIBUTE_TIME_MODIFIED "," G_FILE_ATTRIBUTE_STANDARD_SIZE,
-      G_FILE_QUERY_INFO_NONE, NULL, NULL);
-
-  if (fi) {
-    *out_mtime =
-        g_file_info_get_attribute_uint64(fi, G_FILE_ATTRIBUTE_TIME_MODIFIED);
-    *out_size =
-        g_file_info_get_attribute_uint64(fi, G_FILE_ATTRIBUTE_STANDARD_SIZE);
-    g_object_unref(fi);
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    g_free(path);
+    return FALSE;
   }
-  g_object_unref(gf);
+
+  *out_mtime = st.st_mtime > 0 ? (guint64)st.st_mtime : 0;
+  *out_size = st.st_size > 0 ? (guint64)st.st_size : 0;
 
   *out_path = path;
   return TRUE;
@@ -1194,20 +1245,18 @@ static void schedule_duration_job(NautilusFileInfo *file) {
 
   gboolean is_new = FALSE;
   if (!e) {
-    guint64 *keyp = g_new(guint64, 1);
-    *keyp = key;
-
     e = g_new0(CacheEntry, 1);
-    e->keyp = keyp;
+    e->key = key;
     e->mtime = mtime;
     e->size = size;
     e->seconds = 0;
     e->flags = 0;
     e->negative_until_us = 0;
     e->last_request_us = 0;
-    e->lru_link = NULL;
+    e->lru_prev = NULL;
+    e->lru_next = NULL;
 
-    g_hash_table_insert(entries, keyp, e);
+    g_hash_table_insert(entries, &e->key, e);
     lru_touch_unlocked(e);
     evict_if_needed_unlocked();
     is_new = TRUE;
@@ -1378,8 +1427,7 @@ void nautilus_module_initialize(GTypeModule *module) {
   g_cond_init(&pending_cond);
 
   entries =
-      g_hash_table_new_full(key_u64_hash, key_u64_equal, g_free, entry_destroy);
-  lru = g_queue_new();
+      g_hash_table_new_full(key_u64_hash, key_u64_equal, NULL, entry_destroy);
   pending = g_queue_new();
 
   helper_pool_init(&helper_pool, (gint)helper_max);
@@ -1456,10 +1504,8 @@ void nautilus_module_shutdown(void) {
     pending = NULL;
   }
 
-  if (lru) {
-    g_queue_free(lru);
-    lru = NULL;
-  }
+  lru_reset_unlocked();
+
   if (entries) {
     g_hash_table_destroy(entries);
     entries = NULL;
