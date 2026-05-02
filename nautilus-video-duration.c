@@ -131,6 +131,8 @@ static guint helper_idle_source_id = 0;
 static GSettings *nautilus_list_view_settings = NULL;
 static volatile gint duration_column_enabled = 1;
 
+static void cancel_pending_duration_jobs(void);
+
 /* ------------------- Helpers ------------------- */
 typedef enum {
   MEDIA_KIND_NONE = 0,
@@ -207,7 +209,12 @@ static gboolean visible_columns_contain_duration(GSettings *settings) {
 
 static void refresh_duration_column_enabled(void) {
   gboolean enabled = visible_columns_contain_duration(nautilus_list_view_settings);
+  gint was_enabled = g_atomic_int_get(&duration_column_enabled);
+
   g_atomic_int_set(&duration_column_enabled, enabled ? 1 : 0);
+
+  if (was_enabled && !enabled)
+    cancel_pending_duration_jobs();
 }
 
 static void on_visible_columns_changed(GSettings *settings, gchar *key,
@@ -478,7 +485,8 @@ static gboolean apply_update_main(gpointer data) {
   if (!u)
     return G_SOURCE_REMOVE;
 
-  if (!g_atomic_int_get(&shutting_down)) {
+  if (!g_atomic_int_get(&shutting_down) &&
+      g_atomic_int_get(&duration_column_enabled)) {
     gchar dur[DURATION_TEXT_MAX];
     const gchar *text =
         (!u->negative && u->seconds > 0)
@@ -1169,10 +1177,50 @@ static void job_free(Job *job) {
   g_free(job);
 }
 
+static void clear_job_flags_unlocked(guint64 key) {
+  gpointer fk = NULL, fv = NULL;
+  if (!entries || !g_hash_table_lookup_extended(entries, &key, &fk, &fv))
+    return;
+
+  CacheEntry *e = fv;
+  e->flags &= ~(FLAG_INFLIGHT | FLAG_QUEUED);
+}
+
+static void cancel_pending_duration_jobs(void) {
+  Job *jobs = NULL;
+
+  g_rw_lock_writer_lock(&cache_rwlock);
+  g_mutex_lock(&pending_lock);
+
+  for (;;) {
+    Job *job = pending_queue_pop_head_unlocked();
+    if (!job)
+      break;
+
+    clear_job_flags_unlocked(job->key);
+    job->pending_next = jobs;
+    jobs = job;
+  }
+
+  g_mutex_unlock(&pending_lock);
+  g_rw_lock_writer_unlock(&cache_rwlock);
+
+  while (jobs) {
+    Job *next = jobs->pending_next;
+    jobs->pending_next = NULL;
+    job_free(jobs);
+    jobs = next;
+  }
+}
+
 static void worker_process(Job *job) {
   if (!job)
     return;
-  if (g_atomic_int_get(&shutting_down)) {
+  if (g_atomic_int_get(&shutting_down) ||
+      !g_atomic_int_get(&duration_column_enabled)) {
+    g_rw_lock_writer_lock(&cache_rwlock);
+    clear_job_flags_unlocked(job->key);
+    g_rw_lock_writer_unlock(&cache_rwlock);
     job_free(job);
     return;
   }
@@ -1189,6 +1237,13 @@ static void worker_process(Job *job) {
 
   /* Phase 2.2: Use write lock for cache modification */
   g_rw_lock_writer_lock(&cache_rwlock);
+
+  if (!g_atomic_int_get(&duration_column_enabled)) {
+    clear_job_flags_unlocked(job->key);
+    g_rw_lock_writer_unlock(&cache_rwlock);
+    job_free(job);
+    return;
+  }
 
   gpointer fk = NULL, fv = NULL;
   if (g_hash_table_lookup_extended(entries, &job->key, &fk, &fv)) {
@@ -1284,6 +1339,12 @@ static void schedule_duration_job(NautilusFileInfo *file) {
   gboolean audio = (media_kind == MEDIA_KIND_AUDIO);
 
   g_rw_lock_writer_lock(&cache_rwlock);
+
+  if (!g_atomic_int_get(&duration_column_enabled)) {
+    g_rw_lock_writer_unlock(&cache_rwlock);
+    g_free(path);
+    return;
+  }
 
   CacheEntry *e = NULL;
   gpointer fk = NULL, fv = NULL;
@@ -1469,15 +1530,15 @@ void nautilus_module_initialize(GTypeModule *module) {
   g_atomic_int_set(&shutting_down, 0);
   init_limits_from_env();
 
-  nautilus_list_view_settings = g_settings_new(NAUTILUS_LIST_VIEW_SCHEMA);
-  refresh_duration_column_enabled();
-  g_signal_connect(nautilus_list_view_settings, "changed::" NAUTILUS_VISIBLE_COLUMNS_KEY,
-                   G_CALLBACK(on_visible_columns_changed), NULL);
-
   /* Phase 2.2: Initialize separate locks */
   g_rw_lock_init(&cache_rwlock);
   g_mutex_init(&pending_lock);
   g_cond_init(&pending_cond);
+
+  nautilus_list_view_settings = g_settings_new(NAUTILUS_LIST_VIEW_SCHEMA);
+  refresh_duration_column_enabled();
+  g_signal_connect(nautilus_list_view_settings, "changed::" NAUTILUS_VISIBLE_COLUMNS_KEY,
+                   G_CALLBACK(on_visible_columns_changed), NULL);
 
   entries =
       g_hash_table_new_full(key_u64_hash, key_u64_equal, NULL, entry_destroy);
