@@ -6,7 +6,7 @@
 本项目通过独立的 **FFmpeg helper** 进程获取时长（`vd-ffmpeg-helper`），  
 Nautilus 扩展本体不直接链接 FFmpeg，并提供：
 
-- ✅ 线程池并行计算（线程数 = CPU 核心数）
+- ✅ 线程池并行计算（默认跟随 helper 并发上限）
 - ✅ Helper 进程池 + 超时控制（避免卡住 Nautilus）
 - ✅ 缓存 + LRU 淘汰（默认 512 项）
 - ✅ 主线程安全更新（避免 Nautilus 崩溃）
@@ -21,6 +21,8 @@ Nautilus 扩展本体不直接链接 FFmpeg，并提供：
 - 列名：**时长**
 - 格式：`H:MM:SS`（视频/≥1h 音频）或 `MM:SS`（<1h 音频）
 - 失败/未知显示：`-`
+
+支持常见音频/视频扩展名，包括 Matroska 音频 `.mka`。
 
 ---
 
@@ -188,7 +190,7 @@ nautilus
 
 | 环境变量                          | 说明                 | 默认值     |
 | --------------------------------- | -------------------- | ---------- |
-| `NAUTILUS_VD_THREADS`             | 工作线程数           | CPU 核心数 |
+| `NAUTILUS_VD_THREADS`             | 工作线程数           | 跟随 helper 并发上限 |
 | `NAUTILUS_VD_HELPER_MAX`          | helper 进程并发上限  | 2          |
 | `NAUTILUS_VD_FF_TIMEOUT_MS`       | 单次探测超时（毫秒） | 2000       |
 | `NAUTILUS_VD_FF_RETRY_TIMEOUT_MS` | 重试探测超时（毫秒） | 12000      |

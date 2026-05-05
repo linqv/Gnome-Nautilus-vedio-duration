@@ -4,18 +4,12 @@
 #include <nautilus-extension.h>
 /* for WIFEXITED/WIFSIGNALED */
 #include <signal.h>
-#include <setjmp.h>   /* for sigjmp_buf for crash protection */
 #include <string.h>   /* for memcpy */
 #include <sys/stat.h> /* for stat */
 #include <sys/wait.h>
 
-/* Embedded FFmpeg support (direct API calls, no IPC overhead) */
-#include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
-#include <libavutil/time.h>
-
 #define VD_BUILD_TAG                                                           \
-  "VD_BUILD_TAG: EMBEDDED-ffmpeg-rwlock-2026-01-31"
+  "VD_BUILD_TAG: helper-only-mka-2026-05-03"
 
 #define COLUMN_ID "video-duration::duration"
 #define ATTR_KEY "video-duration::duration"
@@ -157,7 +151,7 @@ static MediaKind media_kind_from_name(const gchar *name) {
   ext++;
 
   static const gchar *const audio_exts[] = {
-      "mp3", "flac", "wav", "aac", "m4a", "ogg",
+      "mp3", "flac", "wav", "aac", "m4a", "mka", "ogg",
       "opus", "wma", "alac", "aiff", NULL};
   static const gchar *const video_exts[] = {
       "mp4", "mkv",  "avi", "mov",  "webm", "flv", "wmv", "m4v",
@@ -520,6 +514,7 @@ typedef struct {
   GDataInputStream *din;
   GOutputStream *out;
   guint req_count;
+  gboolean broken;
 } HelperInstance;
 
 typedef struct {
@@ -767,11 +762,13 @@ static DurationResult helper_request_duration(HelperInstance *h,
   g_free(line);
 
   if (!ok) {
+    h->broken = TRUE;
     g_clear_error(&err);
     return r;
   }
   ok = g_output_stream_flush(h->out, NULL, &err);
   if (!ok) {
+    h->broken = TRUE;
     g_clear_error(&err);
     return r;
   }
@@ -779,6 +776,7 @@ static DurationResult helper_request_duration(HelperInstance *h,
   gsize len = 0;
   gchar *resp = g_data_input_stream_read_line(h->din, &len, NULL, &err);
   if (!resp) {
+    h->broken = TRUE;
     g_clear_error(&err);
     return r;
   }
@@ -809,7 +807,7 @@ static gboolean helper_instance_maybe_restart(HelperPool *p,
   if (!h)
     return FALSE;
 
-  if (!helper_instance_is_alive(h)) {
+  if (h->broken || !helper_instance_is_alive(h)) {
     helper_instance_destroy(h);
     g_mutex_lock(&p->m);
     p->total_created--;
@@ -839,246 +837,7 @@ static gboolean helper_instance_maybe_restart(HelperPool *p,
   return TRUE;
 }
 
-/* ------------------- Embedded FFmpeg Probing (No IPC) ------------------- */
-
-/* Interrupt callback context for timeout control */
-typedef struct {
-  int64_t deadline_us;
-} VdInterruptContext;
-
-static int vd_interrupt_cb(void *opaque) {
-  VdInterruptContext *ctx = (VdInterruptContext *)opaque;
-  if (!ctx)
-    return 0;
-  return (av_gettime_relative() > ctx->deadline_us) ? 1 : 0;
-}
-
-/* Thread-local signal handling for crash protection */
-static __thread sigjmp_buf probe_jmpbuf;
-static __thread volatile sig_atomic_t in_probe = 0;
-
-/* Saved original signal handlers */
-static struct sigaction orig_sigsegv;
-static struct sigaction orig_sigfpe;
-static struct sigaction orig_sigbus;
-static volatile sig_atomic_t probe_signal_handlers_installed = 0;
-
-static const struct sigaction *probe_original_action_for_signal(int sig) {
-  switch (sig) {
-  case SIGSEGV:
-    return &orig_sigsegv;
-  case SIGFPE:
-    return &orig_sigfpe;
-  case SIGBUS:
-    return &orig_sigbus;
-  default:
-    return NULL;
-  }
-}
-
-static void probe_forward_signal(int sig, siginfo_t *info, void *ucontext) {
-  const struct sigaction *orig = probe_original_action_for_signal(sig);
-  if (!orig) {
-    signal(sig, SIG_DFL);
-    raise(sig);
-    return;
-  }
-
-  if (orig->sa_flags & SA_SIGINFO) {
-    if (orig->sa_sigaction)
-      orig->sa_sigaction(sig, info, ucontext);
-    return;
-  }
-
-  if (orig->sa_handler == SIG_IGN)
-    return;
-
-  if (orig->sa_handler == SIG_DFL) {
-    sigaction(sig, orig, NULL);
-    raise(sig);
-    return;
-  }
-
-  orig->sa_handler(sig);
-}
-
-static void probe_signal_handler(int sig, siginfo_t *info, void *ucontext) {
-  if (in_probe) {
-    siglongjmp(probe_jmpbuf, 1);
-  }
-
-  probe_forward_signal(sig, info, ucontext);
-}
-
-static gboolean probe_signal_handlers_install(void) {
-  if (probe_signal_handlers_installed)
-    return TRUE;
-
-  struct sigaction sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_sigaction = probe_signal_handler;
-  sigemptyset(&sa.sa_mask);
-  sigaddset(&sa.sa_mask, SIGSEGV);
-  sigaddset(&sa.sa_mask, SIGFPE);
-  sigaddset(&sa.sa_mask, SIGBUS);
-  sa.sa_flags = SA_SIGINFO;
-
-  if (sigaction(SIGSEGV, &sa, &orig_sigsegv) != 0)
-    return FALSE;
-  if (sigaction(SIGFPE, &sa, &orig_sigfpe) != 0) {
-    sigaction(SIGSEGV, &orig_sigsegv, NULL);
-    return FALSE;
-  }
-  if (sigaction(SIGBUS, &sa, &orig_sigbus) != 0) {
-    sigaction(SIGFPE, &orig_sigfpe, NULL);
-    sigaction(SIGSEGV, &orig_sigsegv, NULL);
-    return FALSE;
-  }
-
-  probe_signal_handlers_installed = 1;
-  return TRUE;
-}
-
-static void probe_signal_handler_restore_one(int sig,
-                                             const struct sigaction *orig) {
-  struct sigaction cur;
-  memset(&cur, 0, sizeof(cur));
-  if (sigaction(sig, NULL, &cur) != 0)
-    return;
-
-  if ((cur.sa_flags & SA_SIGINFO) &&
-      cur.sa_sigaction == probe_signal_handler) {
-    sigaction(sig, orig, NULL);
-  }
-}
-
-static void probe_signal_handlers_restore(void) {
-  if (!probe_signal_handlers_installed)
-    return;
-
-  probe_signal_handler_restore_one(SIGSEGV, &orig_sigsegv);
-  probe_signal_handler_restore_one(SIGFPE, &orig_sigfpe);
-  probe_signal_handler_restore_one(SIGBUS, &orig_sigbus);
-  probe_signal_handlers_installed = 0;
-}
-
-/* Direct probe without IPC - eliminates ~90% overhead */
-static guint32 probe_duration_direct(const gchar *path, guint timeout_ms) {
-  if (!path || timeout_ms == 0)
-    return 0;
-
-  AVFormatContext *fmt = avformat_alloc_context();
-  if (!fmt)
-    return 0;
-
-  VdInterruptContext ictx;
-  ictx.deadline_us = av_gettime_relative() + (int64_t)timeout_ms * 1000;
-
-  fmt->interrupt_callback.callback = vd_interrupt_cb;
-  fmt->interrupt_callback.opaque = &ictx;
-
-  AVDictionary *opts = NULL;
-  av_dict_set(&opts, "probesize", "131072", 0);      /* 128K fast probe */
-  av_dict_set(&opts, "analyzeduration", "0", 0);
-  av_dict_set(&opts, "max_delay", "0", 0);
-
-  int ret = avformat_open_input(&fmt, path, NULL, &opts);
-  av_dict_free(&opts);
-
-  if (ret < 0) {
-    return 0;
-  }
-
-  guint32 sec = 0;
-
-  /* Try container duration first */
-  if (fmt->duration > 0 && fmt->duration != AV_NOPTS_VALUE) {
-    double dsec = (double)fmt->duration / (double)AV_TIME_BASE;
-    sec = (guint32)(dsec + 0.5);
-  }
-
-  /* Fallback: try stream durations */
-  if (sec == 0) {
-    double best = 0.0;
-    for (unsigned i = 0; i < fmt->nb_streams; i++) {
-      AVStream *st = fmt->streams[i];
-      if (st && st->duration > 0 && st->duration != AV_NOPTS_VALUE) {
-        double s = (double)st->duration * av_q2d(st->time_base);
-        if (s > best)
-          best = s;
-      }
-    }
-    if (best > 0)
-      sec = (guint32)(best + 0.5);
-  }
-
-  /* If still no duration, try finding stream info (pass 1) */
-  if (sec == 0 && !vd_interrupt_cb(&ictx)) {
-    AVDictionary *si_opts = NULL;
-    av_dict_set(&si_opts, "probesize", "2097152", 0);      /* 2MB */
-    av_dict_set(&si_opts, "analyzeduration", "1000000", 0); /* 1s */
-
-    ret = avformat_find_stream_info(fmt, &si_opts);
-    av_dict_free(&si_opts);
-
-    if (ret >= 0) {
-      if (fmt->duration > 0 && fmt->duration != AV_NOPTS_VALUE) {
-        double dsec = (double)fmt->duration / (double)AV_TIME_BASE;
-        sec = (guint32)(dsec + 0.5);
-      }
-      if (sec == 0) {
-        double best = 0.0;
-        for (unsigned i = 0; i < fmt->nb_streams; i++) {
-          AVStream *st = fmt->streams[i];
-          if (st && st->duration > 0 && st->duration != AV_NOPTS_VALUE) {
-            double s = (double)st->duration * av_q2d(st->time_base);
-            if (s > best)
-              best = s;
-          }
-        }
-        if (best > 0)
-          sec = (guint32)(best + 0.5);
-      }
-    }
-  }
-
-  avformat_close_input(&fmt);
-  return sec;
-}
-
-/* Safe wrapper with signal handling to prevent FFmpeg crashes from taking down Nautilus */
-static DurationResult get_duration_embedded(const gchar *path) {
-  DurationResult r = {0, FALSE};
-  if (!path)
-    return r;
-
-  if (!probe_signal_handlers_installed)
-    return get_duration_seconds_via_helper(path);
-
-  if (sigsetjmp(probe_jmpbuf, 1) == 0) {
-    /* Normal execution path */
-    in_probe = 1;
-    r.seconds = probe_duration_direct(path, helper_timeout_ms);
-
-    /* If first attempt failed, retry with longer timeout */
-    if (r.seconds == 0) {
-      r.seconds = probe_duration_direct(path, helper_retry_timeout_ms);
-      if (r.seconds == 0) {
-        r.timed_out = TRUE;
-      }
-    }
-  } else {
-    /* Signal was caught - FFmpeg crashed on this file */
-    r.seconds = 0;
-    r.timed_out = FALSE;
-  }
-
-  in_probe = 0;
-
-  return r;
-}
-
-/* Legacy helper-based implementation (kept for fallback) */
+/* Helper-based probing keeps FFmpeg crashes and stalls out of Nautilus. */
 static DurationResult get_duration_seconds_via_helper(const gchar *path) {
   DurationResult r = {0, FALSE};
   if (!path)
@@ -1225,8 +984,7 @@ static void worker_process(Job *job) {
     return;
   }
 
-  /* Phase 2.1: Use embedded FFmpeg probe (direct API call, no IPC overhead) */
-  DurationResult dr = get_duration_embedded(job->path);
+  DurationResult dr = get_duration_seconds_via_helper(job->path);
   guint32 seconds = dr.seconds;
   gboolean negative = (seconds == 0);
   gboolean timeout_fail = (seconds == 0 && dr.timed_out);
@@ -1241,6 +999,7 @@ static void worker_process(Job *job) {
   if (!g_atomic_int_get(&duration_column_enabled)) {
     clear_job_flags_unlocked(job->key);
     g_rw_lock_writer_unlock(&cache_rwlock);
+    post_update_to_main(job->file, 0, TRUE, audio);
     job_free(job);
     return;
   }
@@ -1468,6 +1227,7 @@ static void schedule_duration_job(NautilusFileInfo *file) {
           lru_touch_unlocked(de);
         }
       }
+      post_update_to_main(dropped->file, 0, TRUE, dropped->audio);
     }
 
     if (dropped)
@@ -1518,14 +1278,6 @@ void nautilus_module_initialize(GTypeModule *module) {
   video_duration_register_type(module);
 
   g_message("%s", VD_BUILD_TAG);
-
-  /* Phase 2.1: Initialize FFmpeg for embedded probing */
-  av_log_set_level(AV_LOG_QUIET);
-  avformat_network_init();
-  if (!probe_signal_handlers_install()) {
-    g_warning("VD: failed to install embedded probe signal handlers; "
-              "falling back to helper process");
-  }
 
   g_atomic_int_set(&shutting_down, 0);
   init_limits_from_env();
@@ -1629,7 +1381,6 @@ void nautilus_module_shutdown(void) {
   g_rw_lock_writer_unlock(&cache_rwlock);
 
   helper_pool_clear(&helper_pool);
-  probe_signal_handlers_restore();
 
   if (nautilus_list_view_settings) {
     g_signal_handlers_disconnect_by_func(nautilus_list_view_settings,
@@ -1637,9 +1388,6 @@ void nautilus_module_shutdown(void) {
                                          NULL);
     g_clear_object(&nautilus_list_view_settings);
   }
-
-  /* Phase 2.1: Cleanup FFmpeg */
-  avformat_network_deinit();
 
   g_cond_clear(&pending_cond);
   g_mutex_clear(&pending_lock);

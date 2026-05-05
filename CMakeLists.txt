@@ -67,7 +67,7 @@ pkg_check_modules(GMODULE REQUIRED gmodule-2.0)
 pkg_check_modules(AVFORMAT REQUIRED libavformat)
 pkg_check_modules(AVUTIL REQUIRED libavutil)
 
-# ---- Nautilus extension (with embedded FFmpeg for direct API calls) ----
+# ---- Nautilus extension ----
 add_library(nautilus-video-duration SHARED nautilus-video-duration.c)
 nautilus_vd_enable_max_optimization(nautilus-video-duration)
 
@@ -76,8 +76,6 @@ target_include_directories(nautilus-video-duration PRIVATE
     ${GLIB_INCLUDE_DIRS}
     ${GIO_INCLUDE_DIRS}
     ${GMODULE_INCLUDE_DIRS}
-    ${AVFORMAT_INCLUDE_DIRS}
-    ${AVUTIL_INCLUDE_DIRS}
 )
 
 target_compile_options(nautilus-video-duration PRIVATE
@@ -85,8 +83,6 @@ target_compile_options(nautilus-video-duration PRIVATE
     ${GLIB_CFLAGS_OTHER}
     ${GIO_CFLAGS_OTHER}
     ${GMODULE_CFLAGS_OTHER}
-    ${AVFORMAT_CFLAGS_OTHER}
-    ${AVUTIL_CFLAGS_OTHER}
 )
 
 target_link_libraries(nautilus-video-duration
@@ -94,8 +90,6 @@ target_link_libraries(nautilus-video-duration
     ${GLIB_LIBRARIES}
     ${GIO_LIBRARIES}
     ${GMODULE_LIBRARIES}
-    ${AVFORMAT_LIBRARIES}
-    ${AVUTIL_LIBRARIES}
 )
 
 set_target_properties(nautilus-video-duration PROPERTIES
