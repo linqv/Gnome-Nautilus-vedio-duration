@@ -68,7 +68,9 @@ pkg_check_modules(AVFORMAT REQUIRED libavformat)
 pkg_check_modules(AVUTIL REQUIRED libavutil)
 
 # ---- Nautilus extension ----
-add_library(nautilus-video-duration SHARED nautilus-video-duration.c vd-media.c vd-helper-pool.c)
+add_library(nautilus-video-duration SHARED
+    nautilus-video-duration.c vd-media.c vd-helper-pool.c vd-cache.c vd-scheduler.c
+)
 nautilus_vd_enable_max_optimization(nautilus-video-duration)
 
 target_include_directories(nautilus-video-duration PRIVATE
@@ -146,4 +148,16 @@ if(BUILD_TESTING)
     target_link_libraries(test-helper-pool PRIVATE PkgConfig::GIO)
     add_test(NAME helper-pool COMMAND test-helper-pool $<TARGET_FILE:fake-helper>)
     set_tests_properties(helper-pool PROPERTIES TIMEOUT 15)
+
+    add_executable(test-cache tests/test-cache.c vd-cache.c)
+    target_include_directories(test-cache PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-cache PRIVATE PkgConfig::GLIB)
+    add_test(NAME cache COMMAND test-cache)
+
+    add_executable(test-scheduler tests/test-scheduler.c
+        vd-scheduler.c vd-cache.c vd-helper-pool.c)
+    target_include_directories(test-scheduler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-scheduler PRIVATE PkgConfig::GIO)
+    add_test(NAME scheduler COMMAND test-scheduler $<TARGET_FILE:fake-helper>)
+    set_tests_properties(scheduler PROPERTIES TIMEOUT 15)
 endif()

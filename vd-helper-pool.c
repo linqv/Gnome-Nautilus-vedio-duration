@@ -25,8 +25,9 @@ struct VdHelperPool
   GCancellable *cancel;
 };
 
-static void helper_instance_destroy(HelperInstance *h)
+static void helper_instance_destroy(gpointer data)
 {
+  HelperInstance *h = data;
   if (!h->broken)
     g_output_stream_write_all(h->out, "QUIT\n", 5, NULL, NULL, NULL);
   g_subprocess_force_exit(h->proc);
@@ -250,7 +251,7 @@ void vd_helper_pool_stop(VdHelperPool *pool)
 void vd_helper_pool_free(VdHelperPool *pool)
 {
   vd_helper_pool_stop(pool);
-  g_queue_clear_full(&pool->idle, (GDestroyNotify)helper_instance_destroy);
+  g_queue_clear_full(&pool->idle, helper_instance_destroy);
   g_object_unref(pool->cancel);
   g_free(pool->path);
   g_cond_clear(&pool->available);

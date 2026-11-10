@@ -1,6 +1,6 @@
 #include <glib.h>
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>
 
 /* A directory request signals "ready" and blocks until "release" exists. */
 int main(void)
@@ -22,7 +22,7 @@ int main(void)
     g_free(bytes);
     g_strfreev(parts);
     if (g_str_equal(path, "crash"))
-      return 1;
+      _Exit(1);
     if (g_file_test(path, G_FILE_TEST_IS_DIR))
     {
       gchar *ready = g_build_filename(path, "ready", NULL);
