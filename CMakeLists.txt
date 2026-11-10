@@ -60,7 +60,7 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(NAUTILUS REQUIRED libnautilus-extension-4)
 pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
-pkg_check_modules(GIO REQUIRED gio-2.0)
+pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0)
 pkg_check_modules(GMODULE REQUIRED gmodule-2.0)
 
 # Helper uses FFmpeg libs
@@ -68,7 +68,7 @@ pkg_check_modules(AVFORMAT REQUIRED libavformat)
 pkg_check_modules(AVUTIL REQUIRED libavutil)
 
 # ---- Nautilus extension ----
-add_library(nautilus-video-duration SHARED nautilus-video-duration.c vd-media.c)
+add_library(nautilus-video-duration SHARED nautilus-video-duration.c vd-media.c vd-helper-pool.c)
 nautilus_vd_enable_max_optimization(nautilus-video-duration)
 
 target_include_directories(nautilus-video-duration PRIVATE
@@ -138,4 +138,12 @@ if(BUILD_TESTING)
     target_include_directories(test-media PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(test-media PRIVATE PkgConfig::GLIB)
     add_test(NAME media COMMAND test-media)
+
+    add_executable(fake-helper tests/fake-helper.c)
+    target_link_libraries(fake-helper PRIVATE PkgConfig::GLIB)
+    add_executable(test-helper-pool tests/test-helper-pool.c vd-helper-pool.c)
+    target_include_directories(test-helper-pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-helper-pool PRIVATE PkgConfig::GIO)
+    add_test(NAME helper-pool COMMAND test-helper-pool $<TARGET_FILE:fake-helper>)
+    set_tests_properties(helper-pool PROPERTIES TIMEOUT 15)
 endif()

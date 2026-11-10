@@ -1,3 +1,4 @@
+#include "vd-helper-pool.h"
 #include "vd-media.h"
 
 #include <gio/gio.h>
@@ -122,7 +123,7 @@ static guint helper_retry_timeout_ms = DEFAULT_HELPER_RETRY_TIMEOUT_MS;
 static guint timeout_negative_ttl_sec = DEFAULT_TIMEOUT_NEG_TTL_SEC;
 static guint helper_reqs_before_restart = DEFAULT_HELPER_REQS_BEFORE_RESTART;
 static guint helper_idle_sec = DEFAULT_HELPER_IDLE_SEC;
-static guint helper_idle_source_id = 0;
+static VdHelperPool *helper_pool;
 static GSettings *nautilus_list_view_settings = NULL;
 static volatile gint duration_column_enabled = 1;
 
@@ -457,424 +458,6 @@ static void post_update_to_main(NautilusFileInfo *file, guint32 seconds,
   g_main_context_invoke(NULL, apply_update_main, u);
 }
 
-/* ------------------- Helper Pool ------------------- */
-typedef struct {
-  GSubprocess *proc;
-  GDataInputStream *din;
-  GOutputStream *out;
-  guint req_count;
-  gboolean broken;
-} HelperInstance;
-
-typedef struct {
-  GMutex m;
-  GCond c;
-  GQueue *free_list; /* HelperInstance* */
-  gint total_created;
-  gint capacity;
-  gboolean inited;
-  gchar *helper_path;
-
-  /* 用于空闲回收判断：只在一次“请求结束后”更新 */
-  gint64 last_used_us;
-} HelperPool;
-
-static HelperPool helper_pool;
-
-static gchar *resolve_helper_path(void) {
-  const gchar *env = g_getenv("NAUTILUS_VD_HELPER");
-  if (env && *env)
-    return g_strdup(env);
-  return g_strdup(VD_HELPER_PATH);
-}
-
-static void helper_instance_destroy(HelperInstance *h) {
-  if (!h)
-    return;
-
-  if (h->proc) {
-    /* 先温柔退出：发送 QUIT，让 helper 自己 break 主循环 */
-    if (h->out) {
-      const gchar *q = "QUIT\n";
-      GError *err = NULL;
-      g_output_stream_write_all(h->out, q, strlen(q), NULL, NULL, &err);
-      g_clear_error(&err);
-      g_output_stream_flush(h->out, NULL, NULL);
-    }
-
-    /* 请求退出（SIGTERM） */
-    g_subprocess_send_signal(h->proc, SIGTERM);
-
-    /* 等最多 200ms：轮询 status（结束后才会变为 != -1） */
-    for (int i = 0; i < 20; i++) {
-      int st = g_subprocess_get_status(h->proc);
-      if (st != -1 && (WIFEXITED(st) || WIFSIGNALED(st)))
-        break;
-      g_usleep(10 * 1000);
-    }
-
-    /* 仍未退出：强制结束（比 SIGKILL 更靠谱，glib 自己处理） */
-    {
-      int st2 = g_subprocess_get_status(h->proc);
-      if (!(st2 != -1 && (WIFEXITED(st2) || WIFSIGNALED(st2)))) {
-        g_subprocess_force_exit(h->proc);
-      }
-    }
-
-    /* wait 一下，避免僵尸 */
-    g_subprocess_wait(h->proc, NULL, NULL);
-  }
-
-  if (h->din)
-    g_object_unref(h->din);
-  if (h->out)
-    g_object_unref(h->out);
-  if (h->proc)
-    g_object_unref(h->proc);
-
-  g_free(h);
-}
-
-/* 说明：不要在这里用 g_subprocess_get_status 做太多假设；
- * 我们只用它做轻量判断，且确保不会对已释放对象调用（UAF 已修复）。
- */
-static gboolean helper_instance_is_alive(HelperInstance *h) {
-  if (!h || !h->proc)
-    return FALSE;
-  int st = g_subprocess_get_status(h->proc);
-  if (st == -1)
-    return TRUE;
-  return !(WIFEXITED(st) || WIFSIGNALED(st));
-}
-
-static HelperInstance *helper_instance_spawn(const gchar *helper_path) {
-  GError *err = NULL;
-  const gchar *argv[] = {helper_path, NULL};
-
-  GSubprocess *p = g_subprocess_newv(argv,
-                                     G_SUBPROCESS_FLAGS_STDIN_PIPE |
-                                         G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                         G_SUBPROCESS_FLAGS_STDERR_SILENCE,
-                                     &err);
-  if (!p) {
-    g_message("VD: spawn helper failed: %s", err ? err->message : "(unknown)");
-    g_clear_error(&err);
-    return NULL;
-  }
-
-  GInputStream *stdout_is = g_subprocess_get_stdout_pipe(p);
-  GOutputStream *stdin_os = g_subprocess_get_stdin_pipe(p);
-
-  HelperInstance *h = g_new0(HelperInstance, 1);
-  h->proc = p;
-  h->din = g_data_input_stream_new(stdout_is);
-  h->out = g_object_ref(stdin_os);
-  h->req_count = 0;
-
-  g_data_input_stream_set_newline_type(h->din, G_DATA_STREAM_NEWLINE_TYPE_LF);
-  return h;
-}
-
-static void helper_pool_init(HelperPool *p, gint capacity) {
-  g_mutex_init(&p->m);
-  g_cond_init(&p->c);
-  p->free_list = g_queue_new();
-  p->total_created = 0;
-  p->capacity = capacity;
-  p->inited = TRUE;
-  p->helper_path = resolve_helper_path();
-
-  /* last_used_us 初始化为 now，避免刚启动就被 GC 误判为空闲 */
-  p->last_used_us = g_get_monotonic_time();
-}
-
-static void helper_pool_wake_all(HelperPool *p) {
-  if (!p || !p->inited)
-    return;
-  g_mutex_lock(&p->m);
-  g_cond_broadcast(&p->c);
-  g_mutex_unlock(&p->m);
-}
-
-static gboolean helper_idle_timer_start_main(gpointer data);
-
-static void helper_pool_clear(HelperPool *p) {
-  if (!p || !p->inited)
-    return;
-
-  g_mutex_lock(&p->m);
-  while (!g_queue_is_empty(p->free_list)) {
-    HelperInstance *h = g_queue_pop_head(p->free_list);
-    helper_instance_destroy(h);
-  }
-  g_queue_free(p->free_list);
-  p->free_list = NULL;
-  p->total_created = 0;
-  p->capacity = 0;
-  p->inited = FALSE;
-  p->last_used_us = 0;
-  g_mutex_unlock(&p->m);
-
-  g_free(p->helper_path);
-
-  g_cond_clear(&p->c);
-  g_mutex_clear(&p->m);
-}
-
-/* acquire/release 不再更新 last_used_us！
- * last_used_us 只在“一次请求真正结束后”更新，避免被 Nautilus 周期性触发刷掉。
- */
-static HelperInstance *helper_pool_acquire(HelperPool *p) {
-  if (!p || !p->inited)
-    return NULL;
-
-  g_mutex_lock(&p->m);
-  while (!g_atomic_int_get(&shutting_down)) {
-    if (!g_queue_is_empty(p->free_list)) {
-      HelperInstance *h = g_queue_pop_head(p->free_list);
-      g_mutex_unlock(&p->m);
-      return h;
-    }
-
-    if (p->total_created < p->capacity) {
-      p->total_created++;
-      gchar *hp = g_strdup(p->helper_path);
-      g_mutex_unlock(&p->m);
-
-      HelperInstance *h = helper_instance_spawn(hp);
-      g_free(hp);
-
-      if (!h) {
-        g_mutex_lock(&p->m);
-        p->total_created--;
-        g_cond_signal(&p->c);
-        g_mutex_unlock(&p->m);
-        return NULL;
-      }
-      return h;
-    }
-
-    g_cond_wait(&p->c, &p->m);
-  }
-  g_mutex_unlock(&p->m);
-  return NULL;
-}
-
-static void helper_pool_release(HelperPool *p, HelperInstance *h) {
-  if (!p || !p->inited || !h)
-    return;
-
-  g_mutex_lock(&p->m);
-  g_queue_push_tail(p->free_list, h);
-  g_cond_signal(&p->c);
-  g_mutex_unlock(&p->m);
-
-  if (helper_idle_sec > 0 && !g_atomic_int_get(&shutting_down))
-    g_main_context_invoke(NULL, helper_idle_timer_start_main, NULL);
-}
-
-static void helper_pool_mark_used_now(HelperPool *p) {
-  if (!p || !p->inited)
-    return;
-  g_mutex_lock(&p->m);
-  p->last_used_us = g_get_monotonic_time();
-  g_mutex_unlock(&p->m);
-}
-
-typedef struct {
-  guint32 seconds;
-  gboolean timed_out;
-} DurationResult;
-
-static DurationResult get_duration_seconds_via_helper(const gchar *path);
-
-/* One request to helper. Protocol:
- *   REQ <timeout_ms> <retry_timeout_ms> <b64(path)>\n
- *   -> OK <seconds> <flags>\n
- * flags: include 'T' if timed out.
- */
-static DurationResult helper_request_duration(HelperInstance *h,
-                                              const gchar *path) {
-  DurationResult r = {0, FALSE};
-  if (!h || !path)
-    return r;
-
-  gchar *b64 = g_base64_encode((const guchar *)path, (gsize)strlen(path));
-  gchar *line = g_strdup_printf("REQ %u %u %s\n", helper_timeout_ms,
-                                helper_retry_timeout_ms, b64);
-  g_free(b64);
-
-  GError *err = NULL;
-  gsize written = 0;
-  gboolean ok = g_output_stream_write_all(h->out, line, strlen(line), &written,
-                                          NULL, &err);
-  g_free(line);
-
-  if (!ok) {
-    h->broken = TRUE;
-    g_clear_error(&err);
-    return r;
-  }
-  ok = g_output_stream_flush(h->out, NULL, &err);
-  if (!ok) {
-    h->broken = TRUE;
-    g_clear_error(&err);
-    return r;
-  }
-
-  gsize len = 0;
-  gchar *resp = g_data_input_stream_read_line(h->din, &len, NULL, &err);
-  if (!resp) {
-    h->broken = TRUE;
-    g_clear_error(&err);
-    return r;
-  }
-
-  if (g_str_has_prefix(resp, "OK")) {
-    gchar **parts = g_strsplit(resp, " ", 0);
-    if (parts && parts[1]) {
-      guint64 v = g_ascii_strtoull(parts[1], NULL, 10);
-      if (v > G_MAXUINT32)
-        v = G_MAXUINT32;
-      r.seconds = (guint32)v;
-    }
-    if (parts && parts[2]) {
-      if (strchr(parts[2], 'T'))
-        r.timed_out = TRUE;
-    }
-    g_strfreev(parts);
-  }
-
-  g_free(resp);
-  return r;
-}
-
-/* 修复 UAF：传入 HelperInstance**，销毁时置 NULL，返回是否仍可用 */
-static gboolean helper_instance_maybe_restart(HelperPool *p,
-                                              HelperInstance **ph) {
-  HelperInstance *h = (ph ? *ph : NULL);
-  if (!h)
-    return FALSE;
-
-  if (h->broken || !helper_instance_is_alive(h)) {
-    helper_instance_destroy(h);
-    g_mutex_lock(&p->m);
-    p->total_created--;
-    g_cond_signal(&p->c);
-    g_mutex_unlock(&p->m);
-    *ph = NULL;
-    return FALSE;
-  }
-
-  h->req_count++;
-  if (h->req_count >= helper_reqs_before_restart) {
-    GError *err = NULL;
-    const gchar *q = "QUIT\n";
-    g_output_stream_write_all(h->out, q, strlen(q), NULL, NULL, &err);
-    g_clear_error(&err);
-    g_output_stream_flush(h->out, NULL, NULL);
-
-    helper_instance_destroy(h);
-    g_mutex_lock(&p->m);
-    p->total_created--;
-    g_cond_signal(&p->c);
-    g_mutex_unlock(&p->m);
-    *ph = NULL;
-    return FALSE;
-  }
-
-  return TRUE;
-}
-
-/* Helper-based probing keeps FFmpeg crashes and stalls out of Nautilus. */
-static DurationResult get_duration_seconds_via_helper(const gchar *path) {
-  DurationResult r = {0, FALSE};
-  if (!path)
-    return r;
-
-  HelperInstance *h = helper_pool_acquire(&helper_pool);
-  if (!h)
-    return r;
-
-  r = helper_request_duration(h, path);
-
-  /* 关键：一次请求结束才刷新 last_used_us，用于 idle GC 判定 */
-  helper_pool_mark_used_now(&helper_pool);
-
-  if (helper_instance_maybe_restart(&helper_pool, &h)) {
-    helper_pool_release(&helper_pool, h);
-  }
-  return r;
-}
-
-/* helper 空闲回收：只清 free_list 中空闲实例（busy 的在 worker 手里） */
-static gboolean helper_pool_idle_gc_cb(gpointer data) {
-  HelperPool *p = (HelperPool *)data;
-  if (!p || !p->inited) {
-    helper_idle_source_id = 0;
-    return G_SOURCE_REMOVE;
-  }
-
-  if (g_atomic_int_get(&shutting_down)) {
-    helper_idle_source_id = 0;
-    return G_SOURCE_REMOVE;
-  }
-
-  if (helper_idle_sec == 0) {
-    helper_idle_source_id = 0;
-    return G_SOURCE_REMOVE;
-  }
-
-  gint64 now = g_get_monotonic_time();
-  gboolean remove_timer = FALSE;
-
-  g_mutex_lock(&p->m);
-  gint64 last = p->last_used_us;
-  guint free_n = p->free_list ? (guint)g_queue_get_length(p->free_list) : 0;
-
-  if (free_n == 0) {
-    remove_timer = TRUE;
-  } else if (last != 0 &&
-      (now - last) > (gint64)helper_idle_sec * (gint64)G_USEC_PER_SEC) {
-
-    guint reaped = 0;
-    while (!g_queue_is_empty(p->free_list)) {
-      HelperInstance *h = g_queue_pop_head(p->free_list);
-      helper_instance_destroy(h);
-      p->total_created--;
-      reaped++;
-    }
-
-    g_cond_broadcast(&p->c);
-    p->last_used_us = now;
-    remove_timer = TRUE;
-
-    if (reaped > 0) {
-      g_message("VD: helper_idle_gc reap=%u now_total=%d", reaped,
-                p->total_created);
-    }
-  }
-  g_mutex_unlock(&p->m);
-
-  if (remove_timer) {
-    helper_idle_source_id = 0;
-    return G_SOURCE_REMOVE;
-  }
-
-  return G_SOURCE_CONTINUE;
-}
-
-/* 确保 idle timer 在主线程默认 MainContext 启动 */
-static gboolean helper_idle_timer_start_main(gpointer data) {
-  (void)data;
-  if (helper_idle_source_id == 0 && helper_idle_sec > 0 &&
-      !g_atomic_int_get(&shutting_down)) {
-    helper_idle_source_id =
-        g_timeout_add_seconds(5, helper_pool_idle_gc_cb, &helper_pool);
-  }
-  return G_SOURCE_REMOVE;
-}
-
 /* ------------------- Job / Worker ------------------- */
 static void job_free(Job *job) {
   if (!job)
@@ -933,7 +516,7 @@ static void worker_process(Job *job) {
     return;
   }
 
-  DurationResult dr = get_duration_seconds_via_helper(job->path);
+  DurationResult dr = vd_helper_pool_probe(helper_pool, job->path);
   guint32 seconds = dr.seconds;
   gboolean negative = (seconds == 0);
   gboolean timeout_fail = (seconds == 0 && dr.timed_out);
@@ -1247,7 +830,16 @@ void nautilus_module_initialize(GTypeModule *module) {
   pending_tail = NULL;
   pending_length = 0;
 
-  helper_pool_init(&helper_pool, (gint)helper_max);
+  const gchar *override_path = g_getenv("NAUTILUS_VD_HELPER");
+  VdHelperConfig helper_config = {
+      .path = override_path && *override_path ? override_path : VD_HELPER_PATH,
+      .capacity = helper_max,
+      .timeout_ms = helper_timeout_ms,
+      .retry_timeout_ms = helper_retry_timeout_ms,
+      .requests_before_restart = helper_reqs_before_restart,
+      .idle_sec = helper_idle_sec,
+  };
+  helper_pool = vd_helper_pool_new(&helper_config);
 
   /* helper idle GC starts lazily when a helper becomes idle. */
 
@@ -1276,7 +868,7 @@ void nautilus_module_initialize(GTypeModule *module) {
             queue_max, debounce_ms, negative_ttl_sec, evict_ratio_percent,
             drop_negative_ttl_ms, helper_timeout_ms, helper_retry_timeout_ms,
             timeout_negative_ttl_sec, helper_reqs_before_restart,
-            helper_pool.helper_path, g_atomic_int_get(&duration_column_enabled));
+            helper_config.path, g_atomic_int_get(&duration_column_enabled));
 
   workers = g_new0(GThread *, worker_count);
   for (gint i = 0; i < worker_count; i++)
@@ -1286,19 +878,13 @@ void nautilus_module_initialize(GTypeModule *module) {
 void nautilus_module_shutdown(void) {
   g_atomic_int_set(&shutting_down, 1);
 
-  /* stop idle timer */
-  if (helper_idle_source_id) {
-    g_source_remove(helper_idle_source_id);
-    helper_idle_source_id = 0;
-  }
-
   /* wake pending workers */
   g_mutex_lock(&pending_lock);
   g_cond_broadcast(&pending_cond);
   g_mutex_unlock(&pending_lock);
 
   /* wake helper pool waiters */
-  helper_pool_wake_all(&helper_pool);
+  vd_helper_pool_stop(helper_pool);
 
   if (workers) {
     for (gint i = 0; i < worker_count; i++)
@@ -1329,7 +915,8 @@ void nautilus_module_shutdown(void) {
 
   g_rw_lock_writer_unlock(&cache_rwlock);
 
-  helper_pool_clear(&helper_pool);
+  vd_helper_pool_free(helper_pool);
+  helper_pool = NULL;
 
   if (nautilus_list_view_settings) {
     g_signal_handlers_disconnect_by_func(nautilus_list_view_settings,
