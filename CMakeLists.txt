@@ -59,7 +59,7 @@ endfunction()
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(NAUTILUS REQUIRED libnautilus-extension-4)
-pkg_check_modules(GLIB REQUIRED glib-2.0)
+pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
 pkg_check_modules(GIO REQUIRED gio-2.0)
 pkg_check_modules(GMODULE REQUIRED gmodule-2.0)
 
@@ -68,7 +68,7 @@ pkg_check_modules(AVFORMAT REQUIRED libavformat)
 pkg_check_modules(AVUTIL REQUIRED libavutil)
 
 # ---- Nautilus extension ----
-add_library(nautilus-video-duration SHARED nautilus-video-duration.c)
+add_library(nautilus-video-duration SHARED nautilus-video-duration.c vd-media.c)
 nautilus_vd_enable_max_optimization(nautilus-video-duration)
 
 target_include_directories(nautilus-video-duration PRIVATE
@@ -131,3 +131,11 @@ install(TARGETS nautilus-video-duration
 install(TARGETS vd-ffmpeg-helper
     RUNTIME DESTINATION ${NAUTILUS_EXT_DIR}
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test-media tests/test-media.c vd-media.c)
+    target_include_directories(test-media PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-media PRIVATE PkgConfig::GLIB)
+    add_test(NAME media COMMAND test-media)
+endif()

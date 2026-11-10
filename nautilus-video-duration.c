@@ -1,3 +1,5 @@
+#include "vd-media.h"
+
 #include <gio/gio.h>
 #include <glib-object.h>
 #include <glib.h>
@@ -41,7 +43,6 @@
 #define FLAG_NEGATIVE (1u << 2)
 #define FLAG_QUEUED (1u << 3)
 
-#define DURATION_TEXT_MAX 32
 
 #define VIDEO_DURATION_TYPE (video_duration_get_type())
 G_DECLARE_FINAL_TYPE(VideoDuration, video_duration, VIDEO, DURATION, GObject)
@@ -128,58 +129,6 @@ static volatile gint duration_column_enabled = 1;
 static void cancel_pending_duration_jobs(void);
 
 /* ------------------- Helpers ------------------- */
-typedef enum {
-  MEDIA_KIND_NONE = 0,
-  MEDIA_KIND_VIDEO,
-  MEDIA_KIND_AUDIO,
-} MediaKind;
-
-static gboolean extension_matches(const gchar *ext,
-                                  const gchar *const *exts) {
-  for (int i = 0; exts[i]; i++)
-    if (g_ascii_strcasecmp(ext, exts[i]) == 0)
-      return TRUE;
-  return FALSE;
-}
-
-static MediaKind media_kind_from_name(const gchar *name) {
-  if (!name)
-    return MEDIA_KIND_NONE;
-  const gchar *ext = strrchr(name, '.');
-  if (!ext)
-    return MEDIA_KIND_NONE;
-  ext++;
-
-  static const gchar *const audio_exts[] = {
-      "mp3", "flac", "wav", "aac", "m4a", "mka", "ogg",
-      "opus", "wma", "alac", "aiff", NULL};
-  static const gchar *const video_exts[] = {
-      "mp4", "mkv",  "avi", "mov",  "webm", "flv", "wmv", "m4v",
-      "mpeg", "mpg",  "m2ts", "ts",   "3gp",  "ogv", NULL};
-
-  if (extension_matches(ext, audio_exts))
-    return MEDIA_KIND_AUDIO;
-  if (extension_matches(ext, video_exts))
-    return MEDIA_KIND_VIDEO;
-  return MEDIA_KIND_NONE;
-}
-
-static const gchar *format_seconds_buf(guint32 sec, gboolean is_audio,
-                                       gchar buf[DURATION_TEXT_MAX]) {
-  if (sec == 0)
-    return "-";
-  if (is_audio && sec < 3600) {
-    guint32 m = sec / 60, s = sec % 60;
-    g_snprintf(buf, DURATION_TEXT_MAX, "%02u:%02u", m, s);
-    return buf;
-  }
-  guint32 h = sec / 3600;
-  guint32 m = (sec % 3600) / 60;
-  guint32 s = sec % 60;
-  g_snprintf(buf, DURATION_TEXT_MAX, "%u:%02u:%02u", h, m, s);
-  return buf;
-}
-
 static gboolean visible_columns_contain_duration(GSettings *settings) {
   if (!settings)
     return TRUE;
@@ -484,7 +433,7 @@ static gboolean apply_update_main(gpointer data) {
     gchar dur[DURATION_TEXT_MAX];
     const gchar *text =
         (!u->negative && u->seconds > 0)
-            ? format_seconds_buf(u->seconds, u->audio, dur)
+            ? vd_media_format_seconds(u->seconds, u->audio, dur)
             : "-";
     nautilus_file_info_add_string_attribute(u->file, ATTR_KEY, text);
   }
@@ -1074,7 +1023,7 @@ static void schedule_duration_job(NautilusFileInfo *file) {
     return;
 
   gchar *name = nautilus_file_info_get_name(file);
-  MediaKind media_kind = media_kind_from_name(name);
+  MediaKind media_kind = vd_media_kind_from_name(name);
   if (media_kind == MEDIA_KIND_NONE) {
     g_free(name);
     return;
@@ -1140,7 +1089,7 @@ static void schedule_duration_job(NautilusFileInfo *file) {
     if (dt < (gint64)debounce_ms * 1000) {
       if (e->flags & FLAG_HAS_VALUE) {
         gchar dur[DURATION_TEXT_MAX];
-        const gchar *text = format_seconds_buf(e->seconds, audio, dur);
+        const gchar *text = vd_media_format_seconds(e->seconds, audio, dur);
         nautilus_file_info_add_string_attribute(file, ATTR_KEY, text);
         lru_touch_unlocked(e);
         g_rw_lock_writer_unlock(&cache_rwlock);
@@ -1166,7 +1115,7 @@ static void schedule_duration_job(NautilusFileInfo *file) {
   /* cache hit */
   if (e->flags & FLAG_HAS_VALUE) {
     gchar dur[DURATION_TEXT_MAX];
-    const gchar *text = format_seconds_buf(e->seconds, audio, dur);
+    const gchar *text = vd_media_format_seconds(e->seconds, audio, dur);
     nautilus_file_info_add_string_attribute(file, ATTR_KEY, text);
     lru_touch_unlocked(e);
     g_rw_lock_writer_unlock(&cache_rwlock);
